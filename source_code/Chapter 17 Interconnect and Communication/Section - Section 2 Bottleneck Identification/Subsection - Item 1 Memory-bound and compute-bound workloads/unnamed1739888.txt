@@ -1,0 +1,4 @@
+__global__ void vec_add(float *c, const float *a, const float *b, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
