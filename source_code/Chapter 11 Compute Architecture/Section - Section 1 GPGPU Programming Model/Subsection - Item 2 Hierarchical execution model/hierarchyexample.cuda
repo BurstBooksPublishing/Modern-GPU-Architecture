@@ -1,0 +1,12 @@
+__global__ void matAdd(float *A, float *B, float *C, int N) {
+  extern __shared__ float sbuf[];           // per-block shared memory
+  int local_x = threadIdx.x;                // thread within block
+  int block_x = blockIdx.x;                 // work-group id
+  int global_tid = block_x * blockDim.x + local_x; // eq. \eqref{eq:global_tid}
+  if (global_tid < N) {
+    sbuf[local_x] = A[global_tid] + B[global_tid]; // shared staging
+    __syncthreads();                          // block-level barrier
+    C[global_tid] = sbuf[local_x];
+  }
+  // warp formation is implicit: consecutive local_x form warps for SIMT
+}
