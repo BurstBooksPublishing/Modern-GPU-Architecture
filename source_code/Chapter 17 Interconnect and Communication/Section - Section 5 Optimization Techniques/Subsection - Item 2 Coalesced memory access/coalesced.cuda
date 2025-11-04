@@ -1,0 +1,12 @@
+extern "C" __global__ void compact_and_compute(float* dst, const float* src, int N) {
+  __shared__ float sdata[256];            // shared buffer (size tuned)
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int lane = threadIdx.x;                 // within-warp lane
+  int W = 32;
+  int base = (blockIdx.x * blockDim.x) + (lane / W) * W; // align per-warp base
+  // coalesced load: each contiguous thread reads contiguous src element
+  if (base + lane < N) sdata[lane] = src[base + lane]; // coalesced global load
+  __syncthreads();
+  // compute using shared memory to benefit from compact layout
+  if (tid < N) dst[tid] = sdata[lane] * 2.0f; // simple example compute
+}
