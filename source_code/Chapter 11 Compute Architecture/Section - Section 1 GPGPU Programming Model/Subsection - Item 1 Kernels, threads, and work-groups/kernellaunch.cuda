@@ -1,0 +1,18 @@
+__global__ void tiledGEMM(float* A, float* B, float* C,
+                          int N) {
+  __shared__ float As[32][32]; // tile in shared mem
+  __shared__ float Bs[32][32];
+  int bx = blockIdx.x, by = blockIdx.y;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int row = by*blockDim.y + ty;
+  int col = bx*blockDim.x + tx;
+  float acc = 0.0f;
+  for (int m=0; m < N; m += 32) {
+    As[ty][tx] = A[row*N + (m+tx)]; // load A tile
+    Bs[ty][tx] = B[(m+ty)*N + col]; // load B tile
+    __syncthreads(); // barrier for work-group
+    for (int k=0; k<32; ++k) acc += As[ty][k]*Bs[k][tx];
+    __syncthreads(); // ensure next tile safe
+  }
+  C[row*N + col] = acc; // write result
+}
