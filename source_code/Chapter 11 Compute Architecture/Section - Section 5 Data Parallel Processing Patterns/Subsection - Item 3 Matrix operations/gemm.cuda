@@ -1,0 +1,247 @@
+extern "C" __global__
+void tiledGemm(const float* __restrict__ A, const float* __restrict__ B,
+               float* __restrict__ C, int M, int N, int K) {
+  const int TM = 64, TN = 64, TK = 16; // tile sizes tuned per SM
+  __shared__ float sA[TM][TK]; // cooperative A tile
+  __shared__ float sB[TK][TN]; // cooperative B tile
+
+  int blockRow = blockIdx.y, blockCol = blockIdx.x;
+  int threadRow = threadIdx.y, threadCol = threadIdx.x;
+  int globalRow = blockRow*TM + threadRow;
+  int globalCol = blockCol*TN + threadCol;
+
+  // per-thread register tile (small tile per thread)
+  float acc[4] = {0,0,0,0}; // example of 4-wide inner accumulation
+
+  for (int k0=0; k0 < K; k0 += TK) {
+    // load A and B sub-tiles into shared memory
+    int aRow = globalRow, aCol = k0 + threadCol;
+    if (aRow < M && aCol < K) sA[threadRow][threadCol] = A[aRow*K + aCol];
+    else sA[threadRow][threadCol] = 0.0f;
+
+    int bRow = k0 + threadRow, bCol = globalCol;
+    if (bRow < K && bCol < N) sB[threadRow][threadCol] = B[bRow*N + bCol];
+    else sB[threadRow][threadCol] = 0.0f;
+
+    __syncthreads();
+
+    // compute on the tile
+    for (int k1=0;k1
+\subsection{Item 4:  Prefix sums and reductions}
+These techniques pick up directly from matrix blocking and histogram accumulation: both rely on fast associative aggregation across lanes or threads, so efficient prefix sums and reductions are the primitive that implements those aggregations across an SM or work-group.
+
+Problem — compute an associative prefix (scan) or reduction across a power-of-two SIMD lane group with minimal latency and predictable resource use. Analysis first contrasts two parallel algorithms used on GPUs: Hillis–Steele (inclusive, $S = \log_2 N$ parallel steps but $O(N \log N)$ work) and Blelloch (upsweep/downsweep, $2 \log_2 N$ parallel steps with $O(N)$ work). Practical hardware inside an SM often implements a tree-like scheme mapped to shared memory and SIMD writes to avoid bank conflicts and divergence. The dominant cost metric is the number of synchronization points and global/shared-memory transactions; minimizing these dominates throughput for graphics, compute, and ML kernels.
+
+A compact performance model gives the number of parallel synchronization steps:
+\begin{equation}[H]\label{eq:steps}
+S = \lceil \log_2 N \rceil,
+\end{equation}
+with aggregate work scaling as $W=\Theta(N)$ for the Blelloch-style algorithm. For a simple iterative hardware block that executes one element update per cycle per step, total cycles approximate
+\begin{equation}[H]\label{eq:scan_cycles}
+C \approx N\cdot S + C_{\text{overhead}} = N\log_2 N + O(N).
+\end{equation}
+
+Implementation — the following synthesizable Verilog implements a parameterized inclusive prefix-scan engine that consumes a vector of lane inputs and produces per-lane prefix sums. It is designed for integration into a shared-memory controller or as an SM-local accelerator; it assumes power-of-two \lstinline|LANES| and fixed \lstinline|WIDTH|.
+
+\begin{lstlisting}[language=Verilog,caption=Parameterized iterative prefix-scan unit,label={lst:prefix_scan}]
+module prefix_scan #(
+  parameter integer LANES = 8,
+  parameter integer WIDTH = 32
+)(
+  input  wire                    clk,
+  input  wire                    rst,
+  input  wire                    start,
+  input  wire [LANES*WIDTH-1:0]  in_data,  // concatenated lane inputs
+  output reg  [LANES*WIDTH-1:0]  out_data, // concatenated lane outputs
+  output reg                     done
+);
+  // compute log2(LANES)
+  function integer clog2; input integer v; integer i; begin i=0; while ((1<= offset) next_mem[idx] <= mem[idx] + mem[idx - offset];
+              else next_mem[idx] <= mem[idx];
+              idx <= idx + 1;
+            end else begin
+              // commit next_mem into mem
+              for (i=0;i
+\section{Section 6: Verilog Implementation}
+\subsection{Item 1:  Compute dispatch unit}
+This implementation continues from the kernel launch parsing and work-group scheduling logic, taking the scheduler's ready work-groups and performing hardware-safe matching against SM resources and backpressure. The dispatch unit must ensure correctness under SIMT semantics while maximizing throughput and avoiding resource oversubscription.
+
+Problem: assign work-groups to streaming multiprocessors (SMs) subject to register and shared-memory budgets, while preserving fairness and supporting valid/ready backpressure. Analysis shows the key constraints are per-SM available registers $R_i$ and shared-memory $S_i$, and per-work-group requirements $r_{\mathrm{wg}}$ and $s_{\mathrm{wg}}$. The admission condition for an SM $i$ is $R_i\ge r_{\mathrm{wg}}$ and $S_i\ge s_{\mathrm{wg}}$. The maximum simultaneously resident work-groups per device, $M$, for a homogeneous work-group footprint simplifies to
+\begin{equation}[H]\label{eq:occupancy}
+M \;=\; \min\left(\left\lfloor\frac{R_{\mathrm{tot}}}{r_{\mathrm{wg}}}\right\rfloor,\;\left\lfloor\frac{S_{\mathrm{tot}}}{s_{\mathrm{wg}}}\right\rfloor,\;N_{\mathrm{SM}}\cdot W_{\max}\right),
+\end{equation}
+where $R_{\mathrm{tot}}$ and $S_{\mathrm{tot}}$ are total device resources and $W_{\max}$ is per-SM work-group concurrency.
+
+Implementation: the RTL below implements a FIFO of incoming command packets, a round-robin selection engine that scans NUM_SM SMs for a first-fit that meets resource constraints, and a valid/ready dispatch handshake per SM. The dispatcher consumes one FIFO entry per cycle when an SM accepts the work-group, decrements resources via an external resource-tracker (not included here), and outputs a one-hot select plus the packet payload.
+
+\begin{lstlisting}[language=Verilog,caption={Compute dispatch unit; parameterized SM count and FIFO depth},label={lst:compute_dispatch}]
+module compute_dispatch_unit #(
+  parameter NUM_SM = 8,
+  parameter FIFO_DEPTH = 16,
+  parameter CMD_W = 64,            // packet width
+  parameter REG_W = 16,            // registers bits per SM resource field
+  parameter SMEM_W = 16
+)(
+  input  wire                   clk,
+  input  wire                   rst,
+  // input command FIFO interface
+  input  wire                   cmd_valid,
+  input  wire [CMD_W-1:0]       cmd_data,   // fields: [63:48]=regs_req,[47:32]=smem_req,[31:0]=meta
+  output wire                   cmd_ready,
+  // per-SM resource snapshots (provided by resource tracker)
+  input  wire [NUM_SM*REG_W-1:0] sm_regs_avail, // concatenated [SM0 LSB .. SMN-1 MSB]
+  input  wire [NUM_SM*SMEM_W-1:0] sm_smem_avail,
+  // per-SM ready (SM can accept packet this cycle)
+  input  wire [NUM_SM-1:0]       sm_ready,
+  // dispatch outputs
+  output reg  [NUM_SM-1:0]       dispatch_valid,
+  output reg  [NUM_SM*CMD_W-1:0] dispatch_packet, // one-hot routed; SM i gets slice [i*CMD_W +: CMD_W]
+  input  wire [NUM_SM-1:0]       dispatch_ack   // optional ack from SM (can mirror sm_ready)
+);
+
+  // Simple FIFO
+  reg [CMD_W-1:0] fifo [0:FIFO_DEPTH-1];
+  reg [$clog2(FIFO_DEPTH):0] wr_ptr, rd_ptr, count;
+  wire fifo_full = (count == FIFO_DEPTH);
+  wire fifo_empty = (count == 0);
+  assign cmd_ready = !fifo_full;
+
+  // FIFO write
+  always @(posedge clk) begin
+    if (rst) begin
+      wr_ptr <= 0; rd_ptr <= 0; count <= 0;
+    end else begin
+      if (cmd_valid && cmd_ready) begin
+        fifo[wr_ptr] <= cmd_data; // enqueue
+        wr_ptr <= wr_ptr + 1;
+        count <= count + 1;
+      end
+      // dequeue happens when allocation succeeds (see below)
+    end
+  end
+
+  // extract fields from head entry
+  wire [REG_W-1:0] req_regs = fifo[rd_ptr][63:48];
+  wire [SMEM_W-1:0] req_smem = fifo[rd_ptr][47:32];
+
+  // round-robin pointer
+  reg [$clog2(NUM_SM)-1:0] rr_ptr;
+  integer i;
+  reg [NUM_SM-1:0] candidate_mask;
+  reg allocation_made;
+  reg [$clog2(NUM_SM)-1:0] chosen_sm;
+
+  // selection combinational
+  always @(*) begin
+    candidate_mask = 0;
+    // build per-SM fit mask
+    for (i=0;i= req_regs &&
+          sm_smem_avail[i*SMEM_W +: SMEM_W] >= req_smem &&
+          sm_ready[i]) begin
+        candidate_mask[i] = 1'b1;
+      end else candidate_mask[i] = 1'b0;
+    end
+    // round-robin first-fit search
+    allocation_made = 1'b0;
+    chosen_sm = 0;
+    for (i=0;i
+\subsection{Item 2:  Work-group scheduler}
+The compute dispatch unit presented earlier produces SM-targeted work-group dispatch requests and the work-group scheduler must convert those requests into timely, resource-safe allocations to individual SMs/CUs. This subsection formalizes the scheduler problem, analyzes constraints relevant to SIMT occupancy, and gives a synthesizable Verilog implementation that enforces capacity and fairness.
+
+Problem statement and analysis. A work-group scheduler must:
+\begin{itemize}
+  \item enforce per-SM resource limits (register file, shared memory, warp slots);
+  \item maximize throughput by keeping SMs occupied while avoiding oversubscription;
+  \item provide fairness and support low-latency issuance for interactive kernels.
+\end{itemize}
+Let $R_{\text{sm}}$, $S_{\text{sm}}$, and $W_{\text{sm}}$ be an SM's available registers, shared memory bytes, and warp slots respectively. For a work-group requiring $r_{\text{wg}}$ registers, $s_{\text{wg}}$ shared memory, and $w_{\text{wg}}$ warp slots, the maximum number of resident work-groups per SM satisfies
+\begin{equation}[H]\label{eq:wg_capacity}
+\text{WG}_{\max} \;=\; \min\left(\left\lfloor\frac{R_{\text{sm}}}{r_{\text{wg}}}\right\rfloor,\;\left\lfloor\frac{S_{\text{sm}}}{s_{\text{wg}}}\right\rfloor,\;\left\lfloor\frac{W_{\text{sm}}}{w_{\text{wg}}}\right\rfloor\right).
+\end{equation}
+Enforcing (1) at issue-time prevents dynamic spills and bank contention. Latency hiding requires issuing new work-groups before running SMs stall on memory, so the scheduler should maintain a small lookahead queue per SM.
+
+Design and implementation choices. Two main architectures exist:
+\begin{enumerate}
+  \item centralized scheduler with a global queue and per-SM credit counters — simpler to reason about, scales in hardware cost roughly linearly with number of SMs.
+  \item distributed per-SM queues with occasional work-stealing — reduces central contention and scales better for many SMs, at the cost of complex steal arbitration.
+\end{enumerate}
+This implementation chooses a centralized, credit-based scheduler with round-robin arbitration across SMs and a FIFO work-group buffer. Each SM exposes three credits: registers, shared memory, and warp slots. A work-group is issued when the target SM has all three credits available.
+
+Verilog implementation. The following synthesizable module implements a small centralized scheduler with parameterized SM count and resource granularity. It supports enqueue and synchronous grant signals, and updates per-SM credits on grant and on explicit free notifications.
+
+\begin{lstlisting}[language=Verilog,caption={Work-group scheduler (centralized, credit-based).},label={lst:workgroup_sched}]
+module wg_scheduler #(
+  parameter NUM_SMS = 8,
+  parameter WG_ID_W = 16,
+  parameter REG_QTY_W = 16,
+  parameter SHM_QTY_W = 16,
+  parameter WARP_QTY_W = 8
+)(
+  input  wire clk,
+  input  wire rst, 
+  // enqueue interface from dispatch unit
+  input  wire                  enq_valid,
+  input  wire [WG_ID_W-1:0]    enq_wg_id,
+  input  wire [REG_QTY_W-1:0]  enq_regs,   // regs required
+  input  wire [SHM_QTY_W-1:0]  enq_shm,    // shared mem required
+  input  wire [WARP_QTY_W-1:0] enq_warps,  // warp slots required
+  output reg                   enq_ready,
+  // grant outputs: one SM index and WG assigned
+  output reg                   grant_valid,
+  output reg [$clog2(NUM_SMS)-1:0] grant_sm,
+  output reg [WG_ID_W-1:0]     grant_wg_id,
+  // per-SM credit updates (free notifications)
+  input  wire [NUM_SMS-1:0]                free_valid, 
+  input  wire [REG_QTY_W-1:0]              free_regs [NUM_SMS-1:0],
+  input  wire [SHM_QTY_W-1:0]              free_shm  [NUM_SMS-1:0],
+  input  wire [WARP_QTY_W-1:0]             free_warps [NUM_SMS-1:0],
+  // current SM capacities read-init (static at reset or via config)
+  input  wire [REG_QTY_W-1:0]  sm_regs_init  [NUM_SMS-1:0],
+  input  wire [SHM_QTY_W-1:0]  sm_shm_init   [NUM_SMS-1:0],
+  input  wire [WARP_QTY_W-1:0] sm_warps_init  [NUM_SMS-1:0]
+);
+
+  // Simple FIFO depth 16 for pending work-groups
+  localparam FIFO_D = 16;
+  reg [WG_ID_W-1:0]    fifo_wg_id [FIFO_D-1:0];
+  reg [REG_QTY_W-1:0]  fifo_regs  [FIFO_D-1:0];
+  reg [SHM_QTY_W-1:0]  fifo_shm   [FIFO_D-1:0];
+  reg [WARP_QTY_W-1:0] fifo_warps [FIFO_D-1:0];
+  reg [$clog2(FIFO_D+1)-1:0] fifo_wr_ptr, fifo_rd_ptr;
+  reg [4:0] fifo_count;
+
+  // per-SM dynamic credits
+  reg [REG_QTY_W-1:0]  sm_regs  [NUM_SMS-1:0];
+  reg [SHM_QTY_W-1:0]  sm_shm   [NUM_SMS-1:0];
+  reg [WARP_QTY_W-1:0] sm_warps [NUM_SMS-1:0];
+
+  integer i;
+  // init and free handling
+  always @(posedge clk) begin
+    if (rst) begin
+      fifo_wr_ptr <= 0; fifo_rd_ptr <= 0; fifo_count <= 0;
+      grant_valid <= 0; enq_ready <= 1;
+      for (i=0;i0) begin
+          // check head-of-fifo fits into SM i
+          if ((sm_regs[i]  >= fifo_regs[fifo_rd_ptr]) &&
+              (sm_shm[i]   >= fifo_shm[fifo_rd_ptr]) &&
+              (sm_warps[i] >= fifo_warps[fifo_rd_ptr])) begin
+            // issue grant
+            grant_valid <= 1;
+            grant_sm <= i[$clog2(NUM_SMS)-1:0];
+            grant_wg_id <= fifo_wg_id[fifo_rd_ptr];
+            // consume FIFO head
+            fifo_rd_ptr <= fifo_rd_ptr + 1;
+            fifo_count <= fifo_count - 1;
+            // deduct credits
+            sm_regs[i]  <= sm_regs[i]  - fifo_regs[fifo_rd_ptr];
+            sm_shm[i]   <= sm_shm[i]   - fifo_shm[fifo_rd_ptr];
+            sm_warps[i] <= sm_warps[i] - fifo_warps[fifo_rd_ptr];
+            disable for; // exit loop after grant
+          end
+        end
+      end
+    end
+  end
+
+endmodule
