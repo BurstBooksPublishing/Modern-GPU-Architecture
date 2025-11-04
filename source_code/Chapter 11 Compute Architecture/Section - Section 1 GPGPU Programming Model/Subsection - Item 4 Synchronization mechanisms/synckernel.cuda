@@ -1,0 +1,20 @@
+#include 
+__global__ void reduce_and_publish(int *data, int N, int *out_counter) {
+  extern __shared__ int sdata[]; // per-block shared memory
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int lane = threadIdx.x;
+  // load
+  sdata[lane] = (tid < N) ? data[tid] : 0;
+  __syncthreads(); // block-level barrier
+  // simple tree reduction in shared memory
+  for (int offset = blockDim.x/2; offset>0; offset>>=1) {
+    if (lane < offset) sdata[lane] += sdata[lane+offset];
+    __syncthreads();
+  }
+  if (lane==0) {
+    // publish block result to global memory, ensure visibility to other blocks/host
+    int val = sdata[0];
+    atomicAdd(out_counter, val);      // serialized at global granularity
+    __threadfence_system();           // ensure published value visible system-wide
+  }
+}
