@@ -1,0 +1,39 @@
+extern "C" __global__ void mem_bench(char *data, size_t N, int iterations, int dep) {
+  // dep==1: dependent linked loads (latency-limited)
+  // dep==0: independent loads (bandwidth-favorable)
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
+  unsigned long long acc = 0;
+  for (int it=0; it
+\subsection{Item 3:  Roofline analysis}
+Following the discussion of latency versus bandwidth and the identification of memory-bound versus compute-bound behavior, roofline analysis provides a compact, quantitative view that links arithmetic intensity to achievable performance on a given GPU. It clarifies whether a kernel sits under the memory- or compute- ceiling, and helps prioritize optimizations such as increasing data reuse, changing precision to use tensor cores, or improving memory coalescing.
+
+The roofline model defines arithmetic intensity (AI) as the ratio of useful arithmetic work to bytes transferred from main memory:
+\begin{equation}[H]\label{eq:roofline_perf}
+\text{AI} = \frac{\text{FLOPs}}{\text{Bytes\ transferred}},\qquad
+P(\text{AI})=\min\!\left(P_{\text{peak}},\;B_{\text{mem}}\cdot\text{AI}\right),
+\end{equation}
+where $P_{\text{peak}}$ is the device peak compute throughput (consider per-precision ceilings: FP32, FP16/tensor cores, INT8), and $B_{\text{mem}}$ is sustained memory bandwidth to VRAM after accounting for protocol and interconnect overheads. The ridge point separating memory- and compute-bound regimes is
+\begin{equation}[H]\label{eq:ai_ridge}
+\text{AI}_{\text{ridge}}=\frac{P_{\text{peak}}}{B_{\text{mem}}}.
+\end{equation}
+
+Operational steps to apply roofline on modern GPUs:
+\begin{enumerate}
+\item Measure kernel FLOPs and bytes moved to/from DRAM (exclude cache hits counted as DRAM if they avoid VRAM trips).
+\item Compute AI and then predicted $P(\text{AI})$ using Equation \eqref{eq:roofline_perf}.
+\item Compare measured throughput to prediction; if measured is much lower than $P(\text{AI})$, inspect other bottlenecks (latency, occupancy, memory divergence, instruction mix).
+\end{enumerate}
+
+A practical classification script helps automate decisions. The snippet below computes expected performance and classifies bound type for a kernel on a given GPU:
+
+\begin{lstlisting}[language=Python,caption={Compute roofline prediction and bound classification},label={lst:roofline_predict}]
+def roofline_predict(flops, bytes_moved, peak_flops, bandwidth):
+    # flops: total kernel floating-point ops; bytes_moved: DRAM bytes touched
+    ai = flops / bytes_moved                       # arithmetic intensity (FLOP/byte)
+    peak = peak_flops                              # device peak (FLOP/s)
+    mem_bound_perf = bandwidth * ai                # achievable given memory bandwidth
+    predicted = min(peak, mem_bound_perf)          # roofline prediction (FLOP/s)
+    bound = 'compute-bound' if mem_bound_perf >= peak else 'memory-bound'
+    return {'AI': ai, 'predicted_Flops_per_s': predicted, 'bound': bound}
+# Example: 1e12 FLOPs, 5e10 bytes, 20e12 FLOP/s peak, 1000e9 B/s bandwidth
