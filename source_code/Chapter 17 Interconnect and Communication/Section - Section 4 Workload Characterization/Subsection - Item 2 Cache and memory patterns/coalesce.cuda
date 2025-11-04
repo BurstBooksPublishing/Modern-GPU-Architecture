@@ -1,0 +1,17 @@
+__global__ void strided_add(float *A, float *B, float *C, int N, int stride) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = gid * stride;               // bad: non-contiguous per-thread addresses
+  if (i < N) C[i] = A[i] + B[i];
+}
+
+__global__ void tiled_add(float *A, float *B, float *C, int N) {
+  extern __shared__ float tile[];     // shared memory tile
+  int tid = threadIdx.x, gid = blockIdx.x * blockDim.x + tid;
+  int base = blockIdx.x * blockDim.x;
+  int idx = base + tid;
+  // coalesced load into shared tile (atomic per-thread contiguous load)
+  if (idx < N) tile[tid] = A[idx];
+  __syncthreads();
+  // local compute using tile reduces DRAM reads
+  if (idx < N) C[idx] = tile[tid] + B[idx];
+}
