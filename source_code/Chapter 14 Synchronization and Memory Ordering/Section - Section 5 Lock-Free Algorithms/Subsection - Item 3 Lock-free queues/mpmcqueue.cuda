@@ -1,0 +1,26 @@
+struct Slot { unsigned long long seq; int data; }; // simple payload
+struct MPMCQ {
+  unsigned long long C; // capacity
+  unsigned long long *tail, *head; // global counters (64-bit)
+  Slot *slots; // array of size C in global memory
+};
+
+__device__ void enqueue(MPMCQ *q, int value) {
+  unsigned long long idx = atomicAdd(q->tail, 1ULL); // reserve slot
+  unsigned long long pos = idx % q->C;
+  // spin until slot.seq == idx (producer ownership)
+  while (atomicLoad(&(q->slots[pos].seq)) != idx) { /* backoff or yield */ }
+  q->slots[pos].data = value;               // write payload
+  __threadfence();                          // ensure visibility before publish
+  atomicExch(&(q->slots[pos].seq), idx+1);  // publish (release)
+}
+
+__device__ bool dequeue(MPMCQ *q, int *out) {
+  unsigned long long idx = atomicAdd(q->head, 1ULL); // reserve item
+  unsigned long long pos = idx % q->C;
+  while (atomicLoad(&(q->slots[pos].seq)) != idx+1) { /* backoff or yield */ }
+  *out = q->slots[pos].data;                  // read payload
+  __threadfence();                            // ensure read before marking free
+  atomicExch(&(q->slots[pos].seq), idx + q->C); // mark slot free
+  return true;
+}
