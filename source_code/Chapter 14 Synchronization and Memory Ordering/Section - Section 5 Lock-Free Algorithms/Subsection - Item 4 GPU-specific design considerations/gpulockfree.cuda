@@ -1,0 +1,7 @@
+__device__ unsigned long long pack(void* ptr, unsigned int tag){
+  return ( (unsigned long long)tag << 48 ) | ((unsigned long long)ptr & 0x0000FFFFFFFFFFFFULL);
+}
+__device__ bool cas_head(unsigned long long* head, unsigned long long oldv, unsigned long long newv){
+  return atomicCAS(head, oldv, newv) == oldv; // atomicCAS on 64-bit
+}
+// caller ensures only one lane per warp calls cas_head at a time.
