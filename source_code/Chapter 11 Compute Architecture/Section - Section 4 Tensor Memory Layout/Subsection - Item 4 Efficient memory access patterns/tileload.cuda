@@ -1,0 +1,17 @@
+extern "C" __global__ void loadTile(const float* __restrict__ A, float* __restrict__ tileOut,
+                                     int M, int N, int lda) {
+  __shared__ float tile[32][33]; // 32 banks, 1-element pad to avoid conflicts
+  int tx = threadIdx.x; int ty = threadIdx.y; // thread block maps tile
+  int row = blockIdx.y*32 + ty;
+  int colBase = blockIdx.x*32 + tx*warpSize; // warp-aligned base
+  // coalesced loads: each lane loads contiguous elements
+  #pragma unroll
+  for (int k=0;k<32;k+=warpSize) {
+    int col = colBase + k + (laneId()); // laneId computed in warp
+    if (row < M && col < N) tile[ty][tx*warpSize + k + laneId()] = A[row*lda + col];
+    else tile[ty][tx*warpSize + k + laneId()] = 0.0f;
+  }
+  __syncthreads();
+  // write tileOut in format expected by tensor core (e.g., column-major fragment)
+  if (ty < 32 && tx < 32) tileOut[(blockIdx.y*32+ty)*N + blockIdx.x*32 + tx] = tile[ty][tx];
+}
