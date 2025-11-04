@@ -1,0 +1,19 @@
+__global__ void rasterTileKernel(TileDesc* tiles) {
+  extern __shared__ uint8_t tileBuffer[]; // shared memory tile buffer
+  int tileId = blockIdx.x;                     // one block per tile
+  TileDesc td = tiles[tileId];                 // tile primitive list
+  // 1) preload attributes into shared memory // small burst loads
+  preloadAttributes(td);                       // // amortize TMU fetches
+  __syncthreads();
+  // 2) rasterize pixels in-block using barycentric gradients
+  for (int y = threadIdx.y; y < T; y += blockDim.y)
+    for (int x = threadIdx.x; x < T; x += blockDim.x) {
+      Fragment f = evalFragment(td, x, y);
+      // depth test and blending applied on tileBuffer
+      atomicDepthBlend(tileBuffer, x, y, f); // local merge
+    }
+  __syncthreads();
+  // 3) compress and flush in coalesced global writes
+  if (threadIdx.x == 0 && threadIdx.y == 0)
+    flushCompressed(tileBuffer, td.destAddr); // burst write
+}
