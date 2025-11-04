@@ -1,0 +1,12 @@
+__global__ void decode_tiles(TileDescriptor *tiles, FrameBuf *refs) {
+  int tid = blockIdx.x; // one tile per block
+  TileDescriptor t = tiles[tid];
+  // async prefetch reference region into local L2-writable cache (hw DMA)
+  hw_async_prefetch(refs, t.ref_region);
+  // wait for entropy engine to produce coefficient stream (signal-based)
+  wait_for_entropy(t.entropy_channel);
+  // run inverse transform and MC on SM using shared memory reuse
+  decode_tile_kernel(t, refs);
+  // writeback tile to output framebuffer
+  write_tile_output(t.output_region);
+}
