@@ -1,0 +1,13 @@
+extern "C" __global__ void stride_read_kernel(int *a, int stride, int iters, int n) {
+  int tid = blockIdx.x*blockDim.x + threadIdx.x;
+  // each thread walks a strided slice to probe spatial/temporal reuse
+  int idx = (tid % n);
+  int sum = 0;
+  for (int i = 0; i < iters; ++i) {
+    sum += a[idx];
+    idx = (idx + stride) % n;
+  }
+  // prevent compiler optimization
+  if (tid==0) a[0]=sum;
+}
+// Host: allocate array sizes from L1DRAM and vary stride; read counters via CUPTI or driver APIs.
