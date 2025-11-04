@@ -1,0 +1,22 @@
+extern "C" __global__
+void block_reduce_sum(const float* __restrict__ g_in, float* g_out, int N) {
+  extern __shared__ float sdata[];                // partials per-warp
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  float val = (tid < N) ? g_in[tid] : 0.0f;       // load element (coalesced)
+  // Warp-level reduction using shuffle down (mask full-warp)
+  unsigned mask = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1)
+    val += __shfl_down_sync(mask, val, offset);
+  // thread  lane 0 writes warp partial
+  int lane = threadIdx.x & 31;
+  int wid  = threadIdx.x >> 5;
+  if (lane == 0) sdata[wid] = val;
+  __syncthreads();
+  // final reduction by first warp
+  if (wid == 0) {
+    val = (threadIdx.x < ((blockDim.x+31)/32)) ? sdata[threadIdx.x] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+      val += __shfl_down_sync(mask, val, offset);
+    if (threadIdx.x == 0) g_out[blockIdx.x] = val; // per-block result
+  }
+}
