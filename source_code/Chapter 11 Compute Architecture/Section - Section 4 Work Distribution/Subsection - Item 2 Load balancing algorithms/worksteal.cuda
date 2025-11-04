@@ -1,0 +1,14 @@
+__device__ void worker_loop(TaskQueue *localQ, GlobalQueues *G) {
+  while (true) {
+    Task t;
+    if (localQ->pop(&t)) { // fast local pop (no global contention)
+      execute_task(t);    // run compute or memory-bound work
+    } else {
+      unsigned victim = atomicAdd(&G->stealPtr, 1) % G->numQueues; // choose victim
+      if (G->queues[victim].steal(&t)) { // atomic steal from victim queue
+        execute_task(t);                  // pay steal latency but keep SM busy
+      } else if (global_done(G)) break;   // termination check
+      // else retry or backoff (exponential) to avoid contention
+    }
+  }
+}
