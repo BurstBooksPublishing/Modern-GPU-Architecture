@@ -1,0 +1,48 @@
+__global__ void matmul_layout(const float* A, const float* B, float* C,
+                              int M, int N, int K, int ldA, int ldB) {
+  int row = blockIdx.y*blockDim.y + threadIdx.y;
+  int col = blockIdx.x*blockDim.x + threadIdx.x;
+  float acc = 0.0f;
+  for (int t=0; t
+\subsection{Item 2:  Tiled and blocked formats}
+Building on the linear-order discussion, tiled and blocked layouts reorganize linear storage into small contiguous tiles to improve spatial locality and hardware-friendly reuse. These layouts explicitly trade simple index arithmetic for reduced DRAM transactions, better cache-line utilization, and predictable access patterns for SIMT warps and tensor hardware.
+
+Tiling partitions an $M\times N$ matrix into tiles of size $T\times T$. The number of tiles along each dimension is
+\begin{equation}[H]\label{eq:num_tiles}
+N_{\text{tiles}}^{(r)}=\left\lceil\frac{M}{T}\right\rceil,\qquad
+N_{\text{tiles}}^{(c)}=\left\lceil\frac{N}{T}\right\rceil,
+\end{equation}
+so total tiles $N_{\text{tiles}}=N_{\text{tiles}}^{(r)}N_{\text{tiles}}^{(c)}$. Each tile is stored contiguously (blocked) so a SIMT warp performing a row or column of a tile issues coalesced loads into L1/TMU and then reuses the tile in shared memory or registers for multiple MACs.
+
+Analysis — design goals and pitfalls:
+\begin{itemize}
+\item Tile size $T$ is chosen to match microarchitectural units: common choices are $T=16$ or $32$ to map naturally to warp fragments and tensor cores (e.g., $16\times 16$ WMMA fragments). A tile yields reuse of up to $T$ elements per loaded cache line, increasing arithmetic intensity.
+\item Bank conflicts in shared memory arise when multiple threads in a warp address the same bank. For 32 banks of 4-byte words, bank index is $\text{bank}=(\text{byte\_address}/4)\bmod 32$. If threads access elements with stride $s$ such that $s\cdot \text{sizeof}(\text{element})$ is a multiple of 128 bytes, conflict occurs. A minimal mitigation is row-padding by one element.
+\item Swizzling (e.g., Z-order or Morton curves) further reduces contention at higher memory levels and evens out hot spots across memory controllers, at the cost of slightly more complex address computation.
+\end{itemize}
+
+Implementation example — tiled GEMM kernel demonstrating padding to avoid bank conflicts and tile reuse in shared memory:
+\begin{lstlisting}[language=Cuda,caption={Simple tiled GEMM with shared-memory padding to avoid bank conflicts},label={lst:tile_gemm}]
+template
+__global__ void tiled_gemm(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+  __shared__ float sA[TILE][TILE+1]; // pad to avoid bank conflicts
+  __shared__ float sB[TILE][TILE+1];
+  int row = blockIdx.y * TILE + threadIdx.y;
+  int col = blockIdx.x * TILE + threadIdx.x;
+  float acc = 0.0f;
+  for (int t = 0; t < (K + TILE - 1)/TILE; ++t) {
+    int a_col = t * TILE + threadIdx.x;
+    int b_row = t * TILE + threadIdx.y;
+    // cooperative loads (with boundary checks)
+    sA[threadIdx.y][threadIdx.x] = (row < M && a_col < K) ?
+                                   A[row*K + a_col] : 0.0f;
+    sB[threadIdx.y][threadIdx.x] = (b_row < K && col < N) ?
+                                   B[b_row*N + col] : 0.0f;
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < TILE; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+    __syncthreads();
+  }
+  if (row < M && col < N) C[row*N + col] = acc;
+}
