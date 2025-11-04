@@ -1,0 +1,19 @@
+__global__ void tiled_gemm(const float *A, const float *B, float *C,
+                           int N) {
+  __shared__ float As[BLOCK][BLOCK+1]; // +1 avoids bank conflicts
+  __shared__ float Bs[BLOCK][BLOCK+1]; // padding trick
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int row = blockIdx.y*BLOCK + ty;
+  int col = blockIdx.x*BLOCK + tx;
+  float sum = 0.0f;
+  for (int m = 0; m < N; m += BLOCK) {
+    // cooperative load into shared (coalesced global loads)
+    As[ty][tx] = A[row*N + m + tx]; // aligned global read
+    Bs[ty][tx] = B[(m+ty)*N + col];
+    __syncthreads(); // ensure data ready
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) sum += As[ty][k]*Bs[k][tx];
+    __syncthreads();
+  }
+  C[row*N + col] = sum; // write-back
+}
