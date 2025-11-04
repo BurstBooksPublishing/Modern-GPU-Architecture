@@ -1,0 +1,180 @@
+#define TILE 32
+__global__ void gemm_tiled(const float* A,const float* B,float* C,
+                           int M,int N,int K){
+  __shared__ float sA[TILE][TILE]; // shared reuse of A
+  __shared__ float sB[TILE][TILE]; // shared reuse of B
+  int row = blockIdx.y * TILE + threadIdx.y;
+  int col = blockIdx.x * TILE + threadIdx.x;
+  float acc = 0.0f; // register accumulation
+  for(int kt=0; kt
+\subsection{Item 4:  Arithmetic intensity considerations}
+The previous subsections showed how tiling and careful reuse keep C blocks resident in fast storage, and how data-layout choices expose contiguous accesses; arithmetic intensity ties both ideas to the Roofline model by quantifying compute per byte moved. Here we analyze arithmetic intensity for blocked GEMM, derive a practical rule-of-thumb tied to tile size, and give an implementation pattern that realizes the savings on modern SM/CU hardware.
+
+Problem and analysis: arithmetic intensity (AI) is FLOPs transferred divided by bytes moved between DRAM and the compute engine; it determines whether a kernel is memory-bound or compute-bound on a given GPU with bandwidth $B$ and peak compute $P$. For dense square GEMM of size $N$ with square block (tile) size $b$, each full matrix multiply performs $2N^{3}$ FLOPs. Using a blocking scheme that keeps the destination $C_{i,j}$ block in shared memory or registers across the $K$-loop, $A$ and $B$ blocks must be reloaded for each $k$-step, while each $C$ block is loaded/written only once. Summing DRAM transfers yields total elements moved approximately $2 N^{3} / b + 2 N^{2}$. Therefore the arithmetic intensity (in FLOPs per element) becomes
+\begin{equation}[H]\label{eq:ai_block}
+\mathrm{AI}_{\text{elements}} \;=\; \frac{2N^{3}}{2N^{3}/b + 2N^{2}} \;=\; \frac{b}{1 + b/N}.
+\end{equation}
+Converting to FLOPs per byte, for element size $s$ bytes (single precision $s=4$), gives
+\begin{equation}[H]\label{eq:ai_bytes}
+\mathrm{AI}_{\text{bytes}} \;\approx\; \frac{b}{s(1 + b/N)} \;\xrightarrow{N\gg b}\; \frac{b}{s}.
+\end{equation}
+Thus, for large matrices the arithmetic intensity grows linearly with tile size $b$ (until on-chip capacity limits reuse). Increasing $b$ raises AI and shifts the kernel toward the compute-bound region of the Roofline.
+
+Implementation: the canonical CUDA-style tiled GEMM uses shared memory per SM to buffer $A$ and $B$ tiles; registers hold partial $C$ accumulators. The snippet below shows the core loop using double-buffered shared-memory tiles and FMA-friendly accumulation. Comments indicate mapping to SM resources.
+
+\begin{lstlisting}[language=Cuda,caption={Tiled GEMM kernel sketch using shared memory and register accumulators},label={lst:gemm_tile}]
+__global__ void gemm_tile(const float *A, const float *B, float *C,
+                          int N) {
+  const int b = TILE;                           // tile size
+  __shared__ float As[TILE][TILE];              // shared memory for A
+  __shared__ float Bs[TILE][TILE];              // shared memory for B
+  float c_reg[TILE];                            // register accumulators per thread row
+
+  int tile_i = blockIdx.y * b;
+  int tile_j = blockIdx.x * b;
+  int local_row = threadIdx.y;
+  int local_col = threadIdx.x;
+
+  // init accumulators
+  for (int i=0;i
+\section{Section 2: Tensor Core Architecture}
+\subsection{Item 1:  Systolic array organization}
+The preceding discussion of blocking, tiling, and arithmetic intensity motivates a spatial compute fabric that maximizes data reuse across cycles. Systolic arrays implement that fabric by streaming operands through a grid of pipelined processing elements to convert memory bandwidth into sustained MAC throughput.
+
+A systolic array is a two-dimensional mesh of processing elements (PEs) that forward intermediate operands rhythmically on each clock. Each PE performs a local multiply-accumulate and shifts partials to neighbors, so a single loaded operand participates in many MACs before eviction. Typical dataflows are:
+\begin{itemize}
+  \item weight-stationary: weights stay in PEs, activations stream through;
+  \item output-stationary: partial sums remain local while inputs stream;
+  \item input-stationary: activations stay local and weights stream.
+\end{itemize}
+Choice of dataflow affects on-chip buffering, register pressure, and memory traffic.
+
+Throughput and utilization are driven by array shape and clock. For an $N\times N$ systolic array executing fused multiply-add (FMA), peak arithmetic rate (counting FMA as two floating operations) is
+\begin{equation}[H]\label{eq:flops}
+\text{Peak FLOPS} = 2\cdot N^2 \cdot f,
+\end{equation}
+where $f$ is array clock frequency. Sustained FLOPS require matching memory and staging bandwidth; otherwise utilization collapses.
+
+Operational intensity for a tiled GEMM mapping onto a $T\times T$ tile can be approximated as
+\begin{equation}[H]\label{eq:intensity}
+I \approx \frac{2T^3}{(T^2_w + T^2_a + T^2_o)\cdot B_e},
+\end{equation}
+where $T_w,T_a,T_o$ are sub-tile footprints and $B_e$ is bytes per element. Increasing $T$ improves reuse but increases on-chip buffer size.
+
+Implementation notes for GPUs:
+\begin{enumerate}
+  \item Map each warp or group of warps to feed one or more array tiles, using shared memory as double-buffered staging.
+  \item Use SIMD-friendly operand packing to amortize operand fetch latency across lanes.
+  \item Avoid bank conflicts in shared memory by swizzling tile layout so sequential threads access sequential banks.
+  \item Pipeline accumulation into higher-precision accumulators to avoid saturation for mixed-precision paths.
+\end{enumerate}
+
+A compact, synthesizable integer systolic-array example follows. It instantiates PE cells with registered inputs, producing streamed outputs and accumulating partial sums. This demonstrates the datapath and handshake signals used when integrating into an SM tile engine.
+
+\begin{lstlisting}[language=Verilog,caption={Parameterizable systolic array (integer MAC) example},label={lst:systolic_array}]
+module systolic_pe #(parameter W=16) (
+  input  wire clk, rst,
+  input  wire signed [W-1:0] a_in, b_in,
+  input  wire signed [2*W-1:0] acc_in,
+  output reg  signed [W-1:0] a_out, b_out,
+  output reg  signed [2*W-1:0] acc_out
+);
+  // local multiply-accumulate with pipeline registers
+  reg signed [W-1:0] a_reg, b_reg;
+  reg signed [2*W-1:0] acc_reg;
+  always @(posedge clk) begin
+    if (rst) begin
+      a_reg <= 0; b_reg <= 0; acc_reg <= 0;
+      a_out <= 0; b_out <= 0; acc_out <= 0;
+    end else begin
+      a_reg <= a_in; b_reg <= b_in;
+      // multiply then add to incoming accumulator
+      acc_reg <= acc_in + (a_reg * b_reg);
+      a_out <= a_reg; b_out <= b_reg; acc_out <= acc_reg;
+    end
+  end
+endmodule
+
+module systolic_array #(parameter M=4, N=4, W=16)(
+  input wire clk, rst,
+  input wire signed [W-1:0] a_in [0:M-1], // input column stream
+  input wire signed [W-1:0] b_in [0:N-1], // input row stream
+  output wire signed [2*W-1:0] c_out [0:M-1][0:N-1]
+);
+  // instantiate grid of PEs
+  genvar i,j;
+  wire signed [W-1:0] a_stream [0:M][0:N];
+  wire signed [W-1:0] b_stream [0:M][0:N];
+  wire signed [2*W-1:0] acc_stream [0:M][0:N];
+
+  // initialize input streams at top row/left column
+  generate
+    for (j=0;j
+\subsection{Item 2:  Matrix multiply-accumulate units}
+Building on the spatial dataflow described for systolic arrays, the multiply–accumulate (MAC) cell implements the elemental operation that the array tiles and schedules. The remainder of this subsection analyzes MAC functionality, shows a compact pipelined implementation suitable for GPU tensor cores (integer/fixed-point MACs used in quantized inference and accumulation), and draws engineering trade-offs that impact SM-level throughput, precision, and area.
+
+Problem: provide a high-throughput, pipelined MAC primitive that supports streaming operand supply from shared/L1 memory, minimizes register-file pressure, and preserves accumulator headroom to avoid overflow when $K$ (reduction length) is large. Analysis begins by stating the core operation for a single output element of a GEMM tile:
+\begin{equation}[H]\label{eq:mac_gemm}
+C_{i,j} \; \leftarrow \; C_{i,j} + \sum_{k=0}^{K-1} A_{i,k}\cdot B_{k,j},
+\end{equation}
+where each summand is produced by a MAC cell. For fixed-point or integer MACs used in INT8/INT4 accelerators, the accumulator width must be
+sized to hold the worst-case sum: $\mathrm{ACC\_BITS} \ge \mathrm{WIDTH\_A} + \mathrm{WIDTH\_B} + \lceil \log_2 K\rceil$.
+
+Throughput model: when a tile contains $N_{\mathrm{mac}}$ MAC cells operating in lockstep with one result per cycle, and each fused multiply-add (FMA) is counted as two FLOPs by common vendor metrics, peak throughput is
+\begin{equation}[H]\label{eq:throughput}
+\mathrm{Throughput}_{\mathrm{FLOP/s}} \;=\; 2 \cdot N_{\mathrm{mac}} \cdot f_{\mathrm{clk}}.
+\end{equation}
+
+Implementation constraints: MAC latency must balance clock frequency and pipeline depth, while valid-ready handshakes limit backpressure between the tensor core and SM load-store units. The Verilog below is a synthesizable, parameterized streaming dot-product MAC suitable for a tile cell; it supports signed operands, parameterized widths, and a \lstinline|last| token to end accumulation for an output element.
+
+\begin{lstlisting}[language=Verilog,caption={Streaming pipelined dot-product MAC (synthesizable).},label={lst:mac_verilog}]
+module mac_stream #(
+  parameter WIDTH = 8,           // input operand width
+  parameter ACC_WIDTH = 32       // accumulator width
+)(
+  input  wire                  clk,
+  input  wire                  rst_n,
+  input  wire                  valid_in, // new pair available
+  input  wire signed [WIDTH-1:0] a,
+  input  wire signed [WIDTH-1:0] b,
+  input  wire                  last,     // end of reduction for this output
+  output reg                   ready,    // can accept next pair
+  output reg                   valid_out, // output valid
+  output reg signed [ACC_WIDTH-1:0] out   // accumulated result
+);
+  // pipeline registers for multiply and accumulate
+  reg signed [2*WIDTH-1:0] mul;            // product width
+  reg signed [ACC_WIDTH-1:0] acc;
+  reg active;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      mul <= 0;
+      acc <= 0;
+      out <= 0;
+      ready <= 1;
+      valid_out <= 0;
+      active <= 0;
+    end else begin
+      valid_out <= 0;
+      if (valid_in && ready) begin
+        mul <= a * b;               // combinational multiply clocked
+        // begin accumulation on first valid pair
+        if (!active) begin
+          acc <= {{(ACC_WIDTH-2*WIDTH){mul[2*WIDTH-1]}}, mul}; // sign-extend product
+          active <= 1;
+        end else begin
+          acc <= acc + {{(ACC_WIDTH-2*WIDTH){mul[2*WIDTH-1]}}, mul};
+        end
+        // accept or deassert ready depending on consumer (simple flow control)
+        ready <= 1;
+        if (last) begin
+          out <= acc;               // present accumulated result
+          valid_out <= 1;
+          acc <= 0;
+          active <= 0;
+        end
+      end
+    end
+  end
+endmodule
