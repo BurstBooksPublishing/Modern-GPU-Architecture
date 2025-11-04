@@ -1,0 +1,20 @@
+parameter int ISSUE_WIDTH = 4;
+interface sched_if(input logic clk);
+  logic [$clog2(64)-1:0] warp_id; // warp identifier
+  logic valid;                   // issue valid
+  logic [1:0] instr_type;        // 0:alu,1:mem,2:branch,3:special
+endinterface
+
+// concurrent property: count valid issues per cycle <= ISSUE_WIDTH
+property p_issue_width(sched_if s);
+  @(posedge s.clk) disable iff (!reset_n)
+    ($countones(s.valid) <= ISSUE_WIDTH); // monitor's valid bus width matches interface
+endproperty
+assert property (p_issue_width(sched_if_inst)); // immediate reaction on failure
+
+// coverage: instruction mix and memory coalescing degree
+covergroup cg_instr @(posedge sched_if_inst.clk);
+  coverpoint sched_if_inst.instr_type;            // opcode distribution
+  coverpoint coalescing_degree_bin;               // driven by monitor
+  cross instr_type, coalescing_degree_bin;        // cross-coverage
+endgroup
