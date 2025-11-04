@@ -1,0 +1,7 @@
+__device__ int X=0, Y=0; // global memory
+__global__ void litmus() {
+  int tid = threadIdx.x;
+  if (tid==0) { X = 1; __threadfence(); Y = 1; } // writer with fence
+  if (tid==1) { int r1 = Y; __threadfence(); int r2 = X; /* check r1==1 && r2==0 */ }
+  // without fences r1==1 && r2==0 can occur under relaxed ordering
+}
