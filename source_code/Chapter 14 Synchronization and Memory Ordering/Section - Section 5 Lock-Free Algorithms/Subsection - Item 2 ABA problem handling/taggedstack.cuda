@@ -1,0 +1,29 @@
+struct Node { Node* next; int payload; };                   // node layout
+// pack lower bits of ptr and upper bits tag
+__device__ inline unsigned long long pack(Node* p, unsigned short tag){
+  return (unsigned long long)(uintptr_t)p | ((unsigned long long)tag << 48); // 48/16 split
+}
+__device__ inline void unpack(unsigned long long v, Node*& p, unsigned short& tag){
+  p = (Node*)(uintptr_t)(v & ((1ULL<<48)-1)); tag = (unsigned short)(v >> 48);
+}
+__device__ unsigned long long head;                         // global stack head
+__device__ void push(Node* n){
+  unsigned long long oldv, newv;
+  unsigned short oldtag;
+  do{
+    oldv = atomicAdd(&head, 0ULL);                            // read current head atomically
+    unpack(oldv, n->next, oldtag);                           // reuse old tag
+    newv = pack(n, (unsigned short)(oldtag+1));              // increment tag
+  } while(atomicCAS(&head, oldv, newv) != oldv);             // retry on concurrent modification
+}
+__device__ Node* pop(){
+  unsigned long long oldv, newv;
+  Node* p; unsigned short tag;
+  do{
+    oldv = atomicAdd(&head, 0ULL);
+    unpack(oldv, p, tag);
+    if(!p) return nullptr;
+    newv = pack(p->next, (unsigned short)(tag+1));
+  } while(atomicCAS(&head, oldv, newv) != oldv);
+  return p;
+}
