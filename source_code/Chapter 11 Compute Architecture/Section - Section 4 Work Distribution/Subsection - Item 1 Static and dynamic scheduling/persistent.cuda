@@ -1,0 +1,9 @@
+__device__ int task_counter; // global task index // GPU global memory
+__global__ void persistent_kernel(Task* tasks, int N) {
+  while (true) {
+    int idx = atomicAdd(&task_counter, 1); // dequeue next task
+    if (idx >= N) break;                  // all tasks consumed
+    process_task(tasks[idx]);             // compute, memory ops, TMU usage
+  }
+}
+// launch with many persistent blocks and warps to cover latency
