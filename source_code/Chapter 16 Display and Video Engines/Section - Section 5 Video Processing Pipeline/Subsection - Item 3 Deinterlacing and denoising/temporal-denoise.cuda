@@ -1,0 +1,15 @@
+__global__ void temporal_accum(cudaTextureObject_t tex[], // ring of textures
+                               float2* motionVec,         // per-pixel vectors
+                               float* weight,             // per-pixel weight per frame
+                               float* out, int W, int H, int K) {
+  int x = blockIdx.x*blockDim.x + threadIdx.x;
+  int y = blockIdx.y*blockDim.y + threadIdx.y;
+  if (x>=W||y>=H) return;
+  int p = y*W + x;
+  float num=0.f, den=0.f;
+  for (int k=0;k(tex[k], sx+0.5f, sy+0.5f); // TMU subpixel
+    float w = weight[p + k*W*H];                // confidence+photometric
+    num += w*sample; den += w;
+  }
+  out[p] = den>0 ? num/den : tex2D(tex[0], x+0.5f, y+0.5f);
+}
