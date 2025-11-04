@@ -1,0 +1,49 @@
+__global__ void bin_rays(Ray* rays, int N, int B, int* bucket_offsets, Ray* out) {
+  extern __shared__ int local_counts[]; // per-block counts size B
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  // init shared histogram
+  for (int i=threadIdx.x;i
+\subsection{Item 3:  Cache-aware reordering}
+The preceding discussion showed how binning and coherent wavefront grouping reduce divergence and concentrate rays that follow similar BVH paths; cache-aware reordering builds on those ideas by explicitly reshaping ray order to match BVH memory layout and cache boundaries, improving L1/L2 hit rates during traversal.
+
+Cache-aware reordering problem: independent rays touch BVH nodes and triangle lists with poor temporal locality, causing cache thrash and many high-latency DRAM accesses. Analysis begins with a simple cost model for a ray packet of size $N$: total time is the sum of reordering cost and traversal cost,
+\begin{equation}[H]\label{eq:break_even}
+T_{\text{total}}(N) = T_{\text{reorder}} + N\cdot T_{\text{traverse}}^{\text{reordered}}.
+\end{equation}
+Reordering is beneficial when $T_{\text{total}}(N) < N\cdot T_{\text{traverse}}^{\text{baseline}}$, giving the break-even condition
+\begin{equation}[H]\label{eq:N_break}
+N > \frac{T_{\text{reorder}}}{T_{\text{traverse}}^{\text{baseline}}-T_{\text{traverse}}^{\text{reordered}}}.
+\end{equation}
+Thus the expected traversal-time reduction per ray must amortize the sorting cost across the packet.
+
+Implementation strategies that are effective in real RT cores and GPU SMs:
+\begin{itemize}
+\item BVH-key sorting: compute a spatial key per ray (e.g., a Morton code based on ray origin or hit location) and perform a parallel radix sort to produce locality-preserving order. This aligns successive ray traversals to similar BVH node addresses, increasing cache reuse across SMs.
+\item Leaf-bucket reordering: during binning, tag each ray with the index of its first intersected leaf (or predicted leaf) and stable-partition rays by leaf ID. This avoids expensive global sorts while concentrating accesses to the same triangle lists.
+\item Warp/SM-aware grouping: after global reordering, further shuffle within SIMD groups so that each warp issues memory accesses to contiguous addresses, enabling DRAM coalescing and reducing transaction count.
+\end{itemize}
+
+Practical implementation example: compute Morton keys on-device and call Thrust's sort_by_key to reorder rays and payloads. The following CUDA/C++ snippet shows a production-ready host+kernel pattern used in engines to prepare large wavefronts for traversal.
+
+\begin{lstlisting}[language=C++,caption={Compute Morton keys and reorder rays via Thrust; run prior to BVH traversal.},label={lst:reorder_code}]
+#include 
+#include 
+
+// Kernel: compute 30-bit Morton from ray origins (float3 arrays).
+__global__ void mortonKernel(const float3* origins, uint32_t* keys, int n){
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i>=n) return;
+  // quantize into 1024^3 grid, then interleave bits (implementation omitted for brevity).
+  // Use atomic-free bit-interleave functions on-device.
+  keys[i] = computeMortonFromOrigin(origins[i]);
+}
+
+// Host: sort and permute rays and payloads.
+void reorderRays(float3* d_origins, RayPayload* d_payloads, int n){
+  thrust::device_vector keys(n);
+  mortonKernel<<<(n+255)/256,256>>>(d_origins, thrust::raw_pointer_cast(keys.data()), n);
+  thrust::device_vector indices(n);
+  thrust::sequence(indices.begin(), indices.end());
+  thrust::sort_by_key(keys.begin(), keys.end(), indices.begin()); // stable key sort
+  // scatter origins and payloads to new buffers using indices (device kernels).
+}
