@@ -1,0 +1,13 @@
+__device__ void process_branch_reconv(int *data) {
+  unsigned mask = __ballot_sync(0xFFFFFFFF, /*cond*/ data[threadIdx.x] > 0); // warp-wide cond mask
+  while (mask) {
+    unsigned lane = __ffs(mask) - 1;            // find lowest set lane (1-based ffs)
+    unsigned submask = (1u << lane);            // execute for that subgroup (one lane here)
+    if (__lane_id() == lane) {                  // only that lane executes sensitive code
+      // critical per-lane work; short-lived to avoid serializing whole warp
+      data[threadIdx.x] = compute_heavy(data[threadIdx.x]); // minimal comment
+    }
+    mask &= ~submask;                           // clear handled lane
+  }
+  // reconverge implicitly here when all lanes done
+}
