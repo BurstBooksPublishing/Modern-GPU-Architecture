@@ -1,0 +1,80 @@
+__global__ __launch_bounds__(256,4) void kernel(float *A, int N){
+  __shared__ float s_tile[256];            // shared scratch, lower per-thread regs
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  float acc = 0.0f;                        // keep small live set
+  // compute with reduced temporaries to limit registers
+  if(tid < N){
+    s_tile[threadIdx.x] = A[tid];          // store into shared, then reuse
+    __syncthreads();
+    // use s_tile to perform accumulation; fewer per-thread locals
+    for(int i=0;i
+\subsection{Item 2:  Shared memory partitioning}
+Continuing from register allocation effects on occupancy, shared memory sizing and partitioning is the other major per-SM resource that limits concurrent warps and blocks. The allocator policy for on-chip shared memory can be the dominant factor in achievable occupancy for tiling and ML micro-kernels that use block-local buffers.
+
+Problem: a fixed pool of shared memory per SM must be partitioned among active cooperative-thread-arrays (CTAs or blocks). Analysis begins by expressing the maximum resident blocks per SM as the minimum of the per-resource limits:
+\begin{equation}[H]\label{eq:occupancy_shared}
+N_{\text{blocks}}=\min\!\left(\left\lfloor\frac{R_{\text{SM}}}{R_{\text{per\_block}}}\right\rfloor,\ \left\lfloor\frac{S_{\text{SM}}}{S_{\text{per\_block}}}\right\rfloor,\ N_{\max}\right),
+\end{equation}
+where $R$ denotes registers, $S$ denotes shared bytes, and $N_{\max}$ is architectural block concurrency. For example, with $S_{\text{SM}}=64\ \mathrm{KiB}$ and $S_{\text{per\_block}}=16\ \mathrm{KiB}$, the shared-memory limit is four blocks.
+
+Analysis: static fixed-slot partitioning simplifies allocator hardware and avoids fragmentation, but imposes quantization loss when kernels request non-multiples of slot size. Dynamic allocation gives better utilization but requires allocation metadata and may increase allocation latency or complexity of per-block retirement housekeeping. Bank conflicts remain orthogonal but interact: more, smaller partitions reduce intra-block bank pressure, while larger contiguous allocations improve bulk DMA into shared memory for matrix multiplication tiles feeding tensor cores.
+
+Implementation: a synthesizable per-SM fixed-slot allocator can be implemented as a stack of free slot indices. This enables single-cycle allocate/free operations in common cases and bounded logic for verification. The module below is minimal but production-ready for FPGA/ASIC RTL flows; it supports parameterized slot count and returns a slot index on grant.
+
+\begin{lstlisting}[language=Verilog,caption={Per-SM fixed-slot shared-memory allocator (synthesizable).},label={lst:sm_alloc}]
+module sm_slot_allocator #(parameter SLOT_COUNT=8, SLOT_BITS=$clog2(SLOT_COUNT))(
+    input  wire                 clk,
+    input  wire                 rst_n,
+    input  wire                 alloc_req,   // pulse to request one slot
+    input  wire                 free_req,    // pulse to free one slot
+    input  wire [SLOT_BITS-1:0] free_idx,    // index to free
+    output reg                  alloc_gnt,   // asserted when grant is valid
+    output reg  [SLOT_BITS-1:0] alloc_idx,   // granted slot index
+    output wire                 empty,       // no free slots
+    output wire                 full         // no free slots lost (stack full)
+);
+    reg [SLOT_BITS-1:0] stack [0:SLOT_COUNT-1];
+    reg [$clog2(SLOT_COUNT+1)-1:0] sp; // stack pointer holds count
+    integer i;
+    // initialize stack with all indices
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sp <= SLOT_COUNT;
+            for (i=0;i
+\subsection{Item 3:  Warp and block occupancy}
+The previous subsections established how shared memory partitioning and register allocation constrain per-block resource footprints; this subsection continues by quantifying how those footprints translate into warp and block occupancy on an SM and why that matters for latency hiding and throughput.
+
+Occupancy measures the fraction of the SM's warp slots that are occupied by ready-to-run warps. Operationally, higher occupancy increases the SM's ability to hide long-latency events (global memory, texture fetches, or synchronization), but it is not a sole predictor of performance. Occupancy is bounded by three primary resource constraints: registers, shared memory (LDS), and the hardware limits on warps and blocks per SM. For a kernel with \lstinline|threadsPerBlock| = $T$, registers per thread $r$, and shared memory per block $s$, define warps per block $w_b = T / W_s$ where $W_s$ is warp size (typically 32). The maximum resident blocks due to each resource are:
+
+\begin{equation}[H]\label{eq:resident_blocks}
+\begin{aligned}
+B_{\mathrm{reg}} &= \left\lfloor \dfrac{R_{\mathrm{SM}}}{r \cdot T} \right\rfloor, \\
+B_{\mathrm{sh}}  &= \left\lfloor \dfrac{S_{\mathrm{SM}}}{s} \right\rfloor, \\
+B_{\mathrm{hw}}  &= B_{\mathrm{SM}}^{\max},
+\end{aligned}
+\end{equation}
+
+where $R_{\mathrm{SM}}$ is the total registers per SM, $S_{\mathrm{SM}}$ is shared memory per SM, and $B_{\mathrm{SM}}^{\max}$ is the hardware maximum resident blocks. The resident block count is $B_{\mathrm{res}}=\min(B_{\mathrm{reg}},B_{\mathrm{sh}},B_{\mathrm{hw}})$, yielding active warps $W_{\mathrm{act}}=B_{\mathrm{res}}\cdot w_b$. Occupancy is
+
+\begin{equation}[H]\label{eq:occupancy}
+\text{occupancy} = \dfrac{W_{\mathrm{act}}}{W_{\mathrm{SM}}^{\max}}.
+\end{equation}
+
+Example: $R_{\mathrm{SM}}=65536$, $S_{\mathrm{SM}}=65536$ bytes, $W_{\mathrm{SM}}^{\max}=64$, $B_{\mathrm{SM}}^{\max}=16$, $W_s=32$. For a kernel with \lstinline|T|=256, $r=32$, $s=16\,\mathrm{kB}$: $w_b=8$, $B_{\mathrm{reg}}=8$, $B_{\mathrm{sh}}=4$, so $B_{\mathrm{res}}=4$, $W_{\mathrm{act}}=32$, occupancy = 32/64 = 0.5 (50%). That arithmetic shows how increasing \lstinline|T|, decreasing $r$, or reducing $s$ can change occupancy.
+
+To evaluate occupancy programmatically use a small utility that mirrors the hardware calculation:
+
+\begin{lstlisting}[language=C,caption={SM occupancy calculator (simple model)},label={lst:occup_calc}]
+#include 
+int calc_occupancy(int Rsm,int Ssm,int Wsm_max,int Bsm_max,
+                   int threadsPerBlock,int regPerThread,int shmemPerBlock){
+  int warpSize = 32;
+  int warpsPerBlock = threadsPerBlock/warpSize;                      // assume divisible
+  int B_reg = Rsm / (regPerThread * threadsPerBlock);                // regs limit
+  int B_sh  = Ssm / shmemPerBlock;                                   // shared limit
+  int B_res = B_reg < B_sh ? B_reg : B_sh;                           // min of resource limits
+  if(B_res > Bsm_max) B_res = Bsm_max;                               // hardware block cap
+  int activeWarps = B_res * warpsPerBlock;
+  return (activeWarps * 100) / Wsm_max;                              // occupancy % (integer)
+}
+/* use as: calc_occupancy(65536,65536,64,16,256,32,16384); */
